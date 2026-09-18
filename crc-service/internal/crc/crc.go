@@ -83,18 +83,35 @@ func Checksum(p Params, data []byte) uint64 {
 
 // CheckBytes serialises a check value into the byte order used when the
 // check is appended to the message for transmission and verification.
-// Reflected models (RefOut) transmit the least significant byte first;
-// all others transmit most significant byte first.
+//
+// Verification feeds the appended bytes back through the division loop,
+// so the serialisation must be the exact inverse of that path: the bytes
+// the loop ends up XORing into the register — i.e. after its RefIn
+// reflection — must be the raw register bytes in MSB-first order, which
+// is the only sequence that cancels the register to a constant residue
+// for every message. The check value is the (possibly RefOut-reflected)
+// register, so the wire bytes are
+//
+//	RefIn applied per byte to the big-endian bytes of RefOut(check)
+//
+// (both reflections are involutions, and XorOut contributes only a
+// constant to the residue, so it needs no handling here). When
+// RefIn == RefOut this reduces to the familiar convention: reflected
+// models transmit least significant byte first, all others most
+// significant byte first. When the flags differ, the per-byte RefIn
+// pre-reflection is what keeps encode and verify consistent.
 func CheckBytes(p Params, check uint64) []byte {
 	n := p.Width / 8
+	if p.RefOut {
+		check = reflectBits(check, p.Width)
+	}
 	out := make([]byte, n)
 	for i := 0; i < n; i++ {
-		b := byte(check >> uint(8*i))
-		if p.RefOut {
-			out[i] = b
-		} else {
-			out[n-1-i] = b
+		b := byte(check >> uint(8*(n-1-i)))
+		if p.RefIn {
+			b = reflectByte(b)
 		}
+		out[i] = b
 	}
 	return out
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -140,6 +141,82 @@ func TestVerifyEndpoint(t *testing.T) {
 	if code != 200 || out["valid"] != false {
 		t.Errorf("tampered check accepted: status %d, out %v", code, out)
 	}
+}
+
+// TestVerifyMixedReflectionParams reproduces the reported failure at the
+// API level: explicit parameter sets with RefIn != RefOut must encode to
+// the pinned check values and then verify; flipping any bit of the data
+// or of the check must be rejected. All four reflection combinations are
+// exercised, including the empty payload.
+func TestVerifyMixedReflectionParams(t *testing.T) {
+	s := New()
+	cases := []struct {
+		name   string
+		params string
+		check  string // pinned encode result for "123456789"
+	}{
+		{"refin only", `"width":16,"poly":"0x1021","init":"0x1234","refin":true,"refout":false,"xorout":"0x5678"`, "1BD4"},
+		{"refout only", `"width":16,"poly":"0x1021","init":"0x1234","refin":false,"refout":true,"xorout":"0x5678"`, "81CF"},
+		{"neither", `"width":16,"poly":"0x1021","init":"0x1234","refin":false,"refout":false,"xorout":"0x5678"`, "BB93"},
+		{"both", `"width":16,"poly":"0x1021","init":"0x1234","refin":true,"refout":true,"xorout":"0x5678"`, "63CA"},
+		{"refin only 8-bit", `"width":8,"poly":"0x07","init":"0xFF","refin":true,"refout":false,"xorout":"0x00"`, "0B"},
+		{"refout only 8-bit", `"width":8,"poly":"0x07","init":"0xFF","refin":false,"refout":true,"xorout":"0x00"`, "DF"},
+	}
+	const vec = "313233343536373839" // "123456789"
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			code, enc := do(t, s, "POST", "/v1/checksum",
+				`{"params":{`+c.params+`},"data":"`+vec+`"}`)
+			if code != 200 {
+				t.Fatalf("checksum: status %d: %v", code, enc)
+			}
+			if enc["check"] != c.check {
+				t.Errorf("check = %v, want %s", enc["check"], c.check)
+			}
+
+			code, out := do(t, s, "POST", "/v1/verify",
+				`{"params":{`+c.params+`},"data":"`+vec+`","check":"`+c.check+`"}`)
+			if code != 200 || out["valid"] != true {
+				t.Fatalf("encode-then-verify rejected: status %d, out %v", code, out)
+			}
+			if out["residue"] != out["expected_residue"] {
+				t.Errorf("residue %v != expected %v", out["residue"], out["expected_residue"])
+			}
+
+			// Flip one bit of the payload and of the check value.
+			code, out = do(t, s, "POST", "/v1/verify",
+				`{"params":{`+c.params+`},"data":"313233343536373838","check":"`+c.check+`"}`)
+			if code != 200 || out["valid"] != false {
+				t.Errorf("tampered payload accepted: status %d, out %v", code, out)
+			}
+			code, out = do(t, s, "POST", "/v1/verify",
+				`{"params":{`+c.params+`},"data":"`+vec+`","check":"`+flipLastHexBit(c.check)+`"}`)
+			if code != 200 || out["valid"] != false {
+				t.Errorf("tampered check accepted: status %d, out %v", code, out)
+			}
+
+			// The empty payload must round-trip too.
+			_, enc = do(t, s, "POST", "/v1/checksum", `{"params":{`+c.params+`},"data":""}`)
+			emptyCheck, _ := enc["check"].(string)
+			code, out = do(t, s, "POST", "/v1/verify",
+				`{"params":{`+c.params+`},"data":"","check":"`+emptyCheck+`"}`)
+			if code != 200 || out["valid"] != true {
+				t.Errorf("empty payload rejected: status %d, out %v", code, out)
+			}
+		})
+	}
+}
+
+// flipLastHexBit returns the hex string with its lowest bit toggled.
+func flipLastHexBit(h string) string {
+	last := h[len(h)-1]
+	var r byte
+	if d, err := strconv.ParseUint(string(last), 16, 8); err == nil {
+		r = "0123456789ABCDEF"[d^1]
+	} else {
+		r = last
+	}
+	return h[:len(h)-1] + string(r)
 }
 
 func TestVerifyErrors(t *testing.T) {

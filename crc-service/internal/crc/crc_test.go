@@ -272,6 +272,147 @@ func TestConcurrency(t *testing.T) {
 	}
 }
 
+// TestMixedReflectionVectors pins the check values of the reported
+// mixed-reflection parameter sets (RefIn != RefOut) and requires each
+// one to verify against itself. The check values must not move: the fix
+// for the verify side lives in the check serialisation, not in the
+// checksum computation.
+func TestMixedReflectionVectors(t *testing.T) {
+	data := []byte("123456789")
+	cases := []struct {
+		name   string
+		params Params
+		check  uint64
+	}{
+		{"refin-only-16", Params{Width: 16, Poly: 0x1021, Init: 0x1234, RefIn: true, RefOut: false, XorOut: 0x5678}, 0x1BD4},
+		{"refout-only-16", Params{Width: 16, Poly: 0x1021, Init: 0x1234, RefIn: false, RefOut: true, XorOut: 0x5678}, 0x81CF},
+		{"refin-only-8", Params{Width: 8, Poly: 0x07, Init: 0xFF, RefIn: true, RefOut: false, XorOut: 0x00}, 0x0B},
+	}
+	for _, c := range cases {
+		m, err := NewModel(c.name, c.params)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := m.Checksum(data); got != c.check {
+			t.Errorf("%s: check = %#X, want %#X", c.name, got, c.check)
+		}
+		if ok, residue := m.Verify(data, c.check); !ok {
+			t.Errorf("%s: verify(data, %#X) failed, residue %#X, want %#X", c.name, c.check, residue, m.Residue())
+		}
+	}
+}
+
+// TestAllReflectionCombosRoundTrip encodes payloads of every shape under
+// all four RefIn/RefOut combinations and several widths, and requires
+// data+check to verify — with the residue equal to the model constant
+// every time, which is the invariant Verify relies on.
+func TestAllReflectionCombosRoundTrip(t *testing.T) {
+	rng := rand.New(rand.NewSource(2026))
+	payloads := [][]byte{nil, {}, {0x00}, {0xFF}, []byte("123456789"), {0xDE, 0xAD, 0xBE, 0xEF}}
+	for i := 0; i < 4; i++ {
+		b := make([]byte, 1+rng.Intn(300))
+		rng.Read(b)
+		payloads = append(payloads, b)
+	}
+	bases := []Params{
+		{Width: 8, Poly: 0x07, Init: 0xFF, XorOut: 0x00},
+		{Width: 16, Poly: 0x1021, Init: 0x1234, XorOut: 0x5678},
+		{Width: 32, Poly: 0x04C11DB7, Init: 0xFFFFFFFF, XorOut: 0xFFFFFFFF},
+		{Width: 64, Poly: 0x42F0E1EBA9EA3693, Init: 0x0123456789ABCDEF, XorOut: 0xFEDCBA9876543210},
+	}
+	for _, base := range bases {
+		for _, refin := range []bool{false, true} {
+			for _, refout := range []bool{false, true} {
+				p := base
+				p.RefIn, p.RefOut = refin, refout
+				m, err := NewModel("combo", p)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, data := range payloads {
+					check := m.Checksum(data)
+					ok, residue := m.Verify(data, check)
+					if !ok {
+						t.Errorf("params %+v: verify of %d-byte payload failed, residue %#X, want %#X",
+							p, len(data), residue, m.Residue())
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestMixedReflectionBitFlipFails flips every single bit of the data and
+// of the check value in turn under mixed-reflection parameters;
+// verification must fail every time.
+func TestMixedReflectionBitFlipFails(t *testing.T) {
+	data := []byte("123456789")
+	paramSets := []Params{
+		{Width: 16, Poly: 0x1021, Init: 0x1234, RefIn: true, RefOut: false, XorOut: 0x5678},
+		{Width: 16, Poly: 0x1021, Init: 0x1234, RefIn: false, RefOut: true, XorOut: 0x5678},
+		{Width: 8, Poly: 0x07, Init: 0xFF, RefIn: true, RefOut: false, XorOut: 0x00},
+		{Width: 8, Poly: 0x07, Init: 0xFF, RefIn: false, RefOut: true, XorOut: 0x00},
+	}
+	for _, p := range paramSets {
+		m, err := NewModel("mixed", p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		check := m.Checksum(data)
+		for i := range data {
+			for bit := 0; bit < 8; bit++ {
+				tampered := make([]byte, len(data))
+				copy(tampered, data)
+				tampered[i] ^= 1 << uint(bit)
+				if ok, _ := m.Verify(tampered, check); ok {
+					t.Errorf("params %+v: flipped data bit %d of byte %d still verified", p, bit, i)
+				}
+			}
+		}
+		for bit := 0; bit < p.Width; bit++ {
+			if ok, _ := m.Verify(data, check^(1<<uint(bit))); ok {
+				t.Errorf("params %+v: flipped check bit %d still verified", p, bit)
+			}
+		}
+	}
+}
+
+// TestCustomParamsRoundTripRandomised hammers Verify with random valid
+// parameter sets — every width, every reflection combination, non-zero
+// init and xorout — and requires encode-then-verify to hold for random
+// payloads of every length, including empty.
+func TestCustomParamsRoundTripRandomised(t *testing.T) {
+	rng := rand.New(rand.NewSource(31337))
+	for i := 0; i < 64; i++ {
+		width := 8 * (1 + rng.Intn(8)) // 8,16,...,64
+		mask := maskForWidth(width)
+		p := Params{
+			Width:  width,
+			Poly:   rng.Uint64()&mask | 1, // odd polynomial: every single-bit error is detectable
+			Init:   rng.Uint64() & mask,
+			RefIn:  rng.Intn(2) == 0,
+			RefOut: rng.Intn(2) == 0,
+			XorOut: rng.Uint64() & mask,
+		}
+		m, err := NewModel("random", p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for j := 0; j < 8; j++ {
+			data := make([]byte, rng.Intn(200))
+			rng.Read(data)
+			check := m.Checksum(data)
+			if ok, residue := m.Verify(data, check); !ok {
+				t.Fatalf("params %+v: verify failed for %d-byte payload, residue %#X, want %#X",
+					p, len(data), residue, m.Residue())
+			}
+			if ok, _ := m.Verify(data, check^(1<<uint(rng.Intn(width)))); ok {
+				t.Fatalf("params %+v: tampered check verified for %d-byte payload", p, len(data))
+			}
+		}
+	}
+}
+
 // TestParamValidation rejects out-of-range explicit parameters before
 // any computation.
 func TestParamValidation(t *testing.T) {

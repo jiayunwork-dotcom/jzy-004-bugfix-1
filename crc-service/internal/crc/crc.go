@@ -81,16 +81,34 @@ func Checksum(p Params, data []byte) uint64 {
 	return checksumTable(p, &table, data)
 }
 
-// CheckBytes serialises a check value into the byte order used when the
-// check is appended to the message for transmission and verification.
-// Reflected models (RefOut) transmit the least significant byte first;
-// all others transmit most significant byte first.
+// CheckBytes serialises a check value into the bytes appended to the
+// message for transmission and verification. The form is forced by the
+// CRC algebra: after feeding w extra bits, the register holds
+// (reg ^= Z) shifted through the polynomial, so the appended block must
+// represent Z = RefOut ? reflect(check) : check for the second division
+// to cancel the message register and leave a constant residue.
+//
+// That requirement resolves to two rules:
+//
+//   - if RefIn and RefOut disagree, bit-reverse the check across the full
+//     width before serialising (matched switches need no reversal);
+//   - RefIn selects the byte order, since RefIn describes how bytes are
+//     consumed by the division: reflected input transmits least
+//     significant byte first, plain input most significant byte first.
+//
+// The two rules coincide with the familiar "little-endian for reflected
+// models, big-endian otherwise" convention whenever RefIn == RefOut;
+// only the mixed combinations need the extra reversal. CheckBytes is the
+// single place encoding this, so encode and verify can never disagree.
 func CheckBytes(p Params, check uint64) []byte {
+	if p.RefIn != p.RefOut {
+		check = reflectBits(check, p.Width)
+	}
 	n := p.Width / 8
 	out := make([]byte, n)
 	for i := 0; i < n; i++ {
 		b := byte(check >> uint(8*i))
-		if p.RefOut {
+		if p.RefIn {
 			out[i] = b
 		} else {
 			out[n-1-i] = b

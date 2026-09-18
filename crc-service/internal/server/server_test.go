@@ -2,8 +2,10 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -139,6 +141,98 @@ func TestVerifyEndpoint(t *testing.T) {
 		`{"model":"CRC-16/ARC","data":"313233343536373839","check":"BB3C"}`)
 	if code != 200 || out["valid"] != false {
 		t.Errorf("tampered check accepted: status %d, out %v", code, out)
+	}
+}
+
+// TestMixedReflectionEndToEnd reproduces the incident through the HTTP
+// API: explicit parameter sets whose refin/refout switches disagree must
+// (1) keep the published encode values 1BD4/81CF/0B, (2) verify when the
+// same data and check come straight back, and (3) reject any single-bit
+// change to the data or the check.
+func TestMixedReflectionEndToEnd(t *testing.T) {
+	s := New()
+	cases := []struct {
+		name   string
+		params string
+		check  string
+	}{
+		{"refin-only-16", `{"width":16,"poly":"0x1021","init":"0x1234","refin":true,"refout":false,"xorout":"0x5678"}`, "1BD4"},
+		{"refout-only-16", `{"width":16,"poly":"0x1021","init":"0x1234","refin":false,"refout":true,"xorout":"0x5678"}`, "81CF"},
+		{"refin-only-8", `{"width":8,"poly":"0x07","init":"0xFF","refin":true,"refout":false,"xorout":"0x00"}`, "0B"},
+	}
+	const data = "313233343536373839"
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			code, enc := do(t, s, "POST", "/v1/checksum",
+				`{"params":`+c.params+`,"data":"`+data+`"}`)
+			if code != 200 {
+				t.Fatalf("checksum status %d: %v", code, enc)
+			}
+			if enc["check"] != c.check {
+				t.Fatalf("check = %v, want %s (encoding must not move)", enc["check"], c.check)
+			}
+
+			code, ver := do(t, s, "POST", "/v1/verify",
+				`{"params":`+c.params+`,"data":"`+data+`","check":"`+c.check+`"}`)
+			if code != 200 || ver["valid"] != true {
+				t.Fatalf("round trip rejected: status %d, out %v", code, ver)
+			}
+			if ver["residue"] != ver["expected_residue"] {
+				t.Errorf("residue %v != expected %v", ver["residue"], ver["expected_residue"])
+			}
+
+			// A single-bit flip in the payload must fail.
+			code, ver = do(t, s, "POST", "/v1/verify",
+				`{"params":`+c.params+`,"data":"313233343536373838","check":"`+c.check+`"}`)
+			if code != 200 || ver["valid"] != false {
+				t.Errorf("tampered data accepted: status %d, out %v", code, ver)
+			}
+
+			// A single-bit flip in the check must fail.
+			flipped, err := strconv.ParseUint(c.check, 16, 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			flipped ^= 1
+			code, ver = do(t, s, "POST", "/v1/verify",
+				fmt.Sprintf(`{"params":%s,"data":"%s","check":"%X"}`, c.params, data, flipped))
+			if code != 200 || ver["valid"] != false {
+				t.Errorf("tampered check accepted: status %d, out %v", code, ver)
+			}
+		})
+	}
+}
+
+// TestMixedReflectionEmptyAndSingleByte covers the empty payload (which
+// verified even with the buggy serializer) and a single byte, ensuring
+// the fix works at both ends of the length range.
+func TestMixedReflectionEmptyAndSingleByte(t *testing.T) {
+	s := New()
+	params := []string{
+		`{"width":16,"poly":"0x1021","init":"0x1234","refin":true,"refout":false,"xorout":"0x5678"}`,
+		`{"width":16,"poly":"0x1021","init":"0x1234","refin":false,"refout":true,"xorout":"0x5678"}`,
+	}
+	for _, p := range params {
+		for _, data := range []string{"", "00", "41"} {
+			_, enc := do(t, s, "POST", "/v1/checksum", `{"params":`+p+`,"data":"`+data+`"}`)
+			check := enc["check"].(string)
+			code, ver := do(t, s, "POST", "/v1/verify",
+				`{"params":`+p+`,"data":"`+data+`","check":"`+check+`"}`)
+			if code != 200 || ver["valid"] != true {
+				t.Errorf("params %s data %q: status %d, out %v", p, data, code, ver)
+			}
+		}
+	}
+}
+
+// TestEvenPolynomialRejected ensures the single-bit-error guarantee is
+// not silently voided by a non-generator polynomial.
+func TestEvenPolynomialRejected(t *testing.T) {
+	s := New()
+	code, out := do(t, s, "POST", "/v1/checksum",
+		`{"params":{"width":8,"poly":"0x06"},"data":"31"}`)
+	if code != http.StatusBadRequest || errType(t, out) != ErrInvalidParams {
+		t.Errorf("even polynomial: status %d, out %v", code, out)
 	}
 }
 

@@ -1,6 +1,7 @@
 package crc
 
 import (
+	"bytes"
 	"math/rand"
 	"sync"
 	"testing"
@@ -71,6 +72,200 @@ func TestSingleBitFlipAlwaysFails(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestMixedReflectionVectors pins the three parameter sets from the
+// incident report: mixed RefIn/RefOut switches must keep their published
+// encode values AND round-trip through Verify. These values are
+// cross-checked against an independent bitwise reference; encode must not
+// be "adjusted" to please verify.
+func TestMixedReflectionVectors(t *testing.T) {
+	data := []byte("123456789")
+	cases := []struct {
+		name  string
+		p     Params
+		check uint64
+	}{
+		{"refin-only-16", Params{Width: 16, Poly: 0x1021, Init: 0x1234, RefIn: true, RefOut: false, XorOut: 0x5678}, 0x1BD4},
+		{"refout-only-16", Params{Width: 16, Poly: 0x1021, Init: 0x1234, RefIn: false, RefOut: true, XorOut: 0x5678}, 0x81CF},
+		{"refin-only-8", Params{Width: 8, Poly: 0x07, Init: 0xFF, RefIn: true, RefOut: false, XorOut: 0x00}, 0x0B},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m, err := NewModel(c.name, c.p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := m.Checksum(data); got != c.check {
+				t.Fatalf("check = %#X, want %#X (encoding must not move)", got, c.check)
+			}
+			if ok, residue := m.Verify(data, c.check); !ok {
+				t.Errorf("round trip rejected: residue %#X, want constant %#X", residue, m.Residue())
+			}
+			// The residue constant computed at construction (empty
+			// message) must equal the residue of the real message.
+			if _, residue := m.Verify(data, c.check); residue != m.Residue() {
+				t.Errorf("residue %#X != model constant %#X", residue, m.Residue())
+			}
+		})
+	}
+}
+
+// TestAllReflectionCombinationsRoundTrip exercises every RefIn/RefOut
+// combination across several widths, with zero and non-zero XorOut,
+// against multiple payload shapes (empty, single byte, the catalogue
+// vector, longer random data). Encode followed by verify must always
+// pass on both the table and bitwise paths.
+func TestAllReflectionCombinationsRoundTrip(t *testing.T) {
+	rng := rand.New(rand.NewSource(13))
+	payloads := [][]byte{
+		nil,
+		{},
+		{0x00},
+		{0xFF},
+		[]byte("123456789"),
+		bytes.Repeat([]byte{0xAB}, 257),
+	}
+	long := make([]byte, 1000)
+	rng.Read(long)
+	payloads = append(payloads, long)
+
+	widths := []int{8, 16, 24, 32, 64}
+	for _, width := range widths {
+		mask := maskForWidth(width)
+		// Odd polynomials (constant term set) are exactly the generators
+		// capable of detecting every single-bit error.
+		poly := (rng.Uint64() & mask) | 1
+		init := rng.Uint64() & mask
+		for _, xorOut := range []uint64{0, rng.Uint64() & mask} {
+			for refin := 0; refin <= 1; refin++ {
+				for refout := 0; refout <= 1; refout++ {
+					p := Params{
+						Width:  width,
+						Poly:   poly,
+						Init:   init,
+						RefIn:  refin == 1,
+						RefOut: refout == 1,
+						XorOut: xorOut,
+					}
+					m, err := NewModel("exhaustive", p)
+					if err != nil {
+						t.Fatalf("params %+v: %v", p, err)
+					}
+					table := makeTable(p)
+					for _, data := range payloads {
+						check := m.Checksum(data)
+						if want := checksumBitwise(p, data); want != check {
+							t.Fatalf("%+v: table %#X != bitwise %#X", p, check, want)
+						}
+						if want := checksumTable(p, &table, data); want != check {
+							t.Fatalf("%+v: rebuilt table disagrees", p)
+						}
+						if ok, residue := m.Verify(data, check); !ok {
+							t.Errorf("%+v len=%d: verify failed, residue %#X != %#X",
+								p, len(data), residue, m.Residue())
+						}
+						if ok, _ := m.Verify(data, m.Residue()); ok && check != m.Residue() {
+							t.Errorf("%+v len=%d: a different check value verified", p, len(data))
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestMixedReflectionSingleBitFlip complements the preset-based flip
+// test: for every mixed-reflection parameter set, flipping any bit of the
+// data or of the check value must make Verify fail, including on empty
+// payloads (check-only flips).
+func TestMixedReflectionSingleBitFlip(t *testing.T) {
+	payloads := [][]byte{nil, {0x42}, []byte("123456789"), bytes.Repeat([]byte{0x01, 0xFE}, 64)}
+	sets := []Params{
+		{Width: 8, Poly: 0x07, Init: 0xFF, RefIn: true, RefOut: false},
+		{Width: 8, Poly: 0x31, Init: 0x00, RefIn: false, RefOut: true, XorOut: 0x5A},
+		{Width: 16, Poly: 0x1021, Init: 0x1234, RefIn: true, RefOut: false, XorOut: 0x5678},
+		{Width: 16, Poly: 0x8005, Init: 0xABCD, RefIn: false, RefOut: true, XorOut: 0xFFFF},
+		{Width: 32, Poly: 0x04C11DB7, Init: 0xDEADBEEF, RefIn: true, RefOut: false, XorOut: 0x01020304},
+		{Width: 32, Poly: 0x04C11DB7, Init: 0x01020304, RefIn: false, RefOut: true, XorOut: 0xDEADBEEF},
+	}
+	for _, p := range sets {
+		m, err := NewModel("flip", p)
+		if err != nil {
+			t.Fatalf("%+v: %v", p, err)
+		}
+		for _, data := range payloads {
+			check := m.Checksum(data)
+			if ok, _ := m.Verify(data, check); !ok {
+				t.Fatalf("%+v: baseline round trip failed for len %d", p, len(data))
+			}
+			for i := range data {
+				for bit := 0; bit < 8; bit++ {
+					tampered := make([]byte, len(data))
+					copy(tampered, data)
+					tampered[i] ^= 1 << uint(bit)
+					if ok, _ := m.Verify(tampered, check); ok {
+						t.Errorf("%+v len=%d: flipped data bit %d of byte %d verified", p, len(data), bit, i)
+					}
+				}
+			}
+			for bit := 0; bit < p.Width; bit++ {
+				if ok, _ := m.Verify(data, check^(1<<uint(bit))); ok {
+					t.Errorf("%+v len=%d: flipped check bit %d verified", p, len(data), bit)
+				}
+			}
+		}
+	}
+}
+
+// TestCheckBytesCancellation is the algebraic pin for CheckBytes: for
+// every reflection combination and every message, the residue produced by
+// appending CheckBytes(check) must be the model's precomputed constant,
+// while corrupting any single transmitted byte must leave a different
+// residue.
+func TestCheckBytesCancellation(t *testing.T) {
+	rng := rand.New(rand.NewSource(21))
+	for _, width := range []int{8, 16, 32, 48, 64} {
+		mask := maskForWidth(width)
+		basePoly := uint64(0x07)
+		if width >= 16 {
+			basePoly = 0x1021
+		}
+		for _, p := range []Params{
+			{Width: width, Poly: basePoly, Init: 0, RefIn: false, RefOut: false},
+			{Width: width, Poly: mask&^uint64(1) | 1, Init: mask, RefIn: true, RefOut: true, XorOut: mask},
+			{Width: width, Poly: (rng.Uint64() & mask) | 1, Init: rng.Uint64() & mask, RefIn: true, RefOut: false, XorOut: rng.Uint64() & mask},
+			{Width: width, Poly: (rng.Uint64() & mask) | 1, Init: rng.Uint64() & mask, RefIn: false, RefOut: true, XorOut: rng.Uint64() & mask},
+		} {
+			m, err := NewModel("cancel", p)
+			if err != nil {
+				t.Fatalf("%+v: %v", p, err)
+			}
+			for _, data := range [][]byte{nil, []byte("123456789"), randomBytes(rng, 300)} {
+				check := m.Checksum(data)
+				wire := append(append([]byte{}, data...), CheckBytes(p, check)...)
+				if got := m.Checksum(wire); got != m.Residue() {
+					t.Errorf("%+v len=%d: residue %#X, want %#X", p, len(data), got, m.Residue())
+				}
+				for i := range wire {
+					for bit := 0; bit < 8; bit++ {
+						broken := make([]byte, len(wire))
+						copy(broken, wire)
+						broken[i] ^= 1 << uint(bit)
+						if m.Checksum(broken) == m.Residue() {
+							t.Errorf("%+v: flipping wire bit %d of byte %d still yields residue", p, bit, i)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func randomBytes(rng *rand.Rand, n int) []byte {
+	b := make([]byte, n)
+	rng.Read(b)
+	return b
 }
 
 // TestDifferentWidthsDiffer ensures the 8-bit and 16-bit models do not
@@ -281,6 +476,7 @@ func TestParamValidation(t *testing.T) {
 		{Width: 9, Poly: 0x07},                // not a multiple of 8
 		{Width: 72, Poly: 0x07},               // too wide
 		{Width: 8, Poly: 0x00},                // zero polynomial
+		{Width: 8, Poly: 0x06},                // even polynomial (x factor): cannot detect single-bit errors
 		{Width: 8, Poly: 0x100},               // polynomial exceeds width
 		{Width: 8, Poly: 0x07, Init: 0x100},   // init exceeds width
 		{Width: 8, Poly: 0x07, XorOut: 0x1FF}, // xorout exceeds width

@@ -73,6 +73,13 @@ func (p Params) Validate() error {
 	if p.Poly > mask {
 		return &ParamError{Field: "poly", Message: fmt.Sprintf("exceeds %d-bit width", p.Width)}
 	}
+	if p.Poly&1 == 0 {
+		// A generator with a zero constant term is divisible by x and
+		// cannot be a CRC generator: shifting the register makes the
+		// syndrome of some single-bit errors zero, so one-bit tampering
+		// could verify. Every CRC catalogue polynomial has LSB 1.
+		return &ParamError{Field: "poly", Message: "must be odd (the constant term must be 1); even polynomials cannot detect single-bit errors"}
+	}
 	if p.Init > mask {
 		return &ParamError{Field: "init", Message: fmt.Sprintf("exceeds %d-bit width", p.Width)}
 	}
